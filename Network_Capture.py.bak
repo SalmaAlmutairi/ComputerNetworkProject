@@ -1,0 +1,338 @@
+import sys
+import socket
+import threading
+import time
+from collections import defaultdict
+import logging
+from datetime import datetime
+import scapy.all as scapy
+import matplotlib.pyplot as plt
+import os
+
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+print_lock = threading.Lock()
+
+logging.basicConfig(
+    filename="network_events.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s"
+)
+
+throughput_data = defaultdict(int)
+latency_data = {}
+unique_ips = set()
+unique_macs = set()
+packet_sizes = []
+tcp_connections = defaultdict(int)
+protocol_counts = defaultdict(int)
+exit_flag = threading.Event()
+client_threads = []
+
+packet_sizes_by_protocol = defaultdict(list)
+tcp_connections_real_time = set()  
+udp_connections_real_time = set()  
+
+def calculate_throughput(interval=10):
+    """Calculates throughput every given interval (in seconds)."""
+    sleep_interval = 0.5
+    elapsed_time = 0
+    try:
+        while not exit_flag.is_set():
+            if exit_flag.wait(timeout=sleep_interval):  
+                break
+            elapsed_time += sleep_interval
+
+            if elapsed_time >= interval:
+                with print_lock:  
+                    print("\n--- Throughput (bps) ---")
+                    if throughput_data:
+                        for protocol, bytes_count in throughput_data.items():
+                            throughput_bps = (bytes_count * 8) / interval
+                            print(f"{protocol}: {throughput_bps:.2f} bps")
+                            
+                            # Log throughput to the log file
+                            logging.info(f"Throughput: Protocol: {protocol}, Throughput: {throughput_bps:.2f} bps")
+                    else:
+                        print("No throughput data collected yet.")
+                    throughput_data.clear()
+                    elapsed_time = 0
+                    sys.stdout.flush()  
+
+                sys.stdout.flush() 
+    except KeyboardInterrupt:
+          print("\nExiting program...")
+          exit_flag.set()
+          capture_thread.stop()
+          server_thread.stop()
+          sys.exit()
+
+def analyze_packet(packet):
+    """Analyzes a captured packet and logs the details."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]  
+
+    if scapy.Ether in packet:
+        source_mac = packet[scapy.Ether].src
+        destination_mac = packet[scapy.Ether].dst
+        packet_size = len(packet)
+        unique_macs.update([source_mac, destination_mac])
+        logging.info(
+            f"{timestamp} - Ethernet: Source MAC: {source_mac}, Destination MAC: {destination_mac}, Packet Size: {packet_size} bytes"
+        )
+        update_event_data("Ethernet", source_mac, destination_mac, packet_size, time.time())
+
+    if scapy.IP in packet:
+        source_ip = packet[scapy.IP].src
+        destination_ip = packet[scapy.IP].dst
+        protocol = packet[scapy.IP].proto
+        unique_ips.update([source_ip, destination_ip])
+        protocol_counts[protocol] += 1
+        packet_sizes_by_protocol[protocol].append(len(packet))
+        logging.info(
+            f"{timestamp} - IP: Source IP: {source_ip}, Destination IP: {destination_ip}, Protocol: {protocol}, Packet Size: {len(packet)} bytes"
+        )
+
+        if scapy.TCP in packet:
+            source_port = packet[scapy.TCP].sport
+            destination_port = packet[scapy.TCP].dport
+            flags = packet[scapy.TCP].flags
+            update_event_data("TCP", source_ip, destination_ip, len(packet), time.time())
+            logging.info(
+                f"{timestamp} - TCP: Source Port: {source_port}, Destination Port: {destination_port}, Packet Size: {len(packet)} bytes, Flags: {flags}"
+            )
+
+        elif scapy.UDP in packet:
+            source_port = packet[scapy.UDP].sport
+            destination_port = packet[scapy.UDP].dport
+            update_event_data("UDP", source_ip, destination_ip, len(packet), time.time())
+            logging.info(
+                f"{timestamp} - UDP: Source Port: {source_port}, Destination Port: {destination_port}, Packet Size: {len(packet)} bytes"
+            )
+
+def update_event_data(protocol, src_addr, dest_addr, message_size, timestamp):
+    """Updates throughput, latency data, and active connections."""
+    throughput_data[protocol] += message_size
+    if protocol == "Ethernet":
+        unique_macs.update([src_addr, dest_addr])
+    else:
+        unique_ips.update([src_addr, dest_addr])
+
+    if protocol == "TCP":
+        tcp_connections_real_time.add((src_addr, dest_addr))
+    elif protocol == "UDP":
+        udp_connections_real_time.add((src_addr, dest_addr))
+
+    if protocol in ["TCP", "UDP"]:
+        conn_key = (src_addr, dest_addr)
+        if conn_key not in latency_data:
+            latency_data[conn_key] = {"start": timestamp, "end": None}
+        latency_data[conn_key]["end"] = timestamp 
+
+def display_metrics():
+    """Displays network metrics."""
+    print("\n----- Real-Time Network Metrics -----")
+    print(f"Unique IP addresses: {len(unique_ips)}")
+    print(f"Unique MAC addresses: {len(unique_macs)}")
+
+    for protocol, count in protocol_counts.items():
+        avg_packet_size = sum(packet_sizes_by_protocol[protocol]) / len(packet_sizes_by_protocol[protocol]) if packet_sizes_by_protocol[protocol] else 0
+        print(f"\nProtocol {protocol}: {count} packets")
+        print(f"  Average packet size: {avg_packet_size:.2f} bytes")
+    
+    print(f"\nActive TCP connections: {len(tcp_connections_real_time)}")
+    print(f"Active UDP connections: {len(udp_connections_real_time)}")
+
+    # Calculate and log average latency
+    total_latency = 0
+    completed_connections = 0
+    for conn_key, times in latency_data.items():
+        if times["start"] is not None and times["end"] is not None:
+            latency = times["end"] - times["start"]
+            total_latency += latency
+            completed_connections += 1
+            # Log latency to the log file
+            logging.info(f"Latency: Connection {conn_key}, Latency: {latency:.4f} seconds")
+    avg_latency = total_latency / completed_connections if completed_connections > 0 else 0
+    print(f"\nAverage Latency for Completed Connections: {avg_latency:.4f} seconds")
+    logging.info(f"Average Latency: {avg_latency:.4f} seconds")  # Log the average latency as well
+
+    print("----- End of Metrics -----\n")
+
+def handle_client(client_socket, address):
+    """Handles a single client connection."""
+    print(f"[Connected] New connection from {address}")
+    try:
+        while not exit_flag.is_set():
+            client_socket.settimeout(1)
+            try:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                update_event_data("TCP", address, address, len(data), time.time())
+            except socket.timeout:
+                continue
+    finally:
+        client_socket.close()
+        tcp_connections_real_time.discard(address)
+        print(f"[-] Closed connection with {address}")
+
+def start_server(host="0.0.0.0", port=9999):
+    """Starts the server."""
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((host, port))
+    server_socket.listen(5)
+    print(f"[Listening] Server is listening on {host}:{port}")
+
+    try:
+        throughput_thread = threading.Thread(target=calculate_throughput, daemon=True)
+        throughput_thread.start()
+
+        while not exit_flag.is_set():
+            server_socket.settimeout(1)
+            try:
+                client_socket, address = server_socket.accept()
+                client_thread = threading.Thread(target=handle_client, args=(client_socket, address), daemon=True)
+                client_thread.start()
+                client_threads.append(client_thread)
+            except socket.timeout:
+                continue
+
+    except Exception as e:
+        print(f"[ERROR] Server error: {e}")
+    
+    finally:
+        print("[INFO] Shutting down server...")
+        for thread in client_threads:
+            thread.join()
+        server_socket.close()
+        print("[INFO] Server socket closed.")
+
+def start_client(server_address, server_port):
+    """Starts a client socket to connect to a server."""
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket.connect((server_address, server_port))
+    try:
+        while not exit_flag.is_set():
+            message = "X" * 1024
+            client_socket.send(message.encode())
+            time.sleep(2)
+    finally:
+        client_socket.close()
+
+def start_capture():
+    """Starts packet capture."""
+    sniffer_thread = threading.Thread(target=lambda: scapy.sniff(prn=analyze_packet, store=False), daemon=True)
+    sniffer_thread.start()
+    try:
+        while sniffer_thread.is_alive() and not exit_flag.is_set():
+            if exit_flag.wait(timeout=30):  
+                break
+            display_metrics()
+    except KeyboardInterrupt:
+        print("\nStopping capture...")
+        exit_flag.set()
+    sniffer_thread.join()
+
+def update_graph(interval=1):  # Default to 1 second if not provided
+    while not exit_flag.is_set():
+        plt.clf()  # Clear the figure to update the graphs
+
+        # Plot 1: Throughput line graph for each protocol
+        protocols = list(throughput_data.keys())
+        throughput_values = [bytes_count * 8 / interval for bytes_count in throughput_data.values()]  # Throughput in bps
+
+        # Logarithmic scale can be applied to make differences more visible
+        plt.subplot(221)
+        if throughput_values:
+            plt.plot(protocols, throughput_values, marker='o', color='blue', label='Throughput (bps)')
+            plt.yscale('log')  # Apply logarithmic scale to y-axis for better visualization of differences
+            plt.title('Throughput per Protocol (Log Scale)')
+            plt.xlabel('Protocol')
+            plt.ylabel('Throughput (bps)')
+            plt.legend()
+
+        # Plot 2: Latency line graph (Latency over Time)
+        latencies = [
+            times["end"] - times["start"]
+            for times in latency_data.values()
+            if times["start"] is not None and times["end"] is not None
+        ]
+        plt.subplot(222)
+        if latencies:
+            plt.plot(latencies, marker='x', color='green', label='Latency (s)')
+            plt.title('Latency over Time')
+            plt.ylabel('Latency (seconds)')
+            plt.legend()
+        else:
+            plt.text(0.5, 0.5, "No latency data", horizontalalignment='center', verticalalignment='center')
+
+        # Plot 3: Active TCP/UDP connections bar chart
+        active_tcp_connections = len(tcp_connections_real_time)  # Active TCP connections
+        active_udp_connections = len(udp_connections_real_time)  # Active UDP connections
+        plt.subplot(223)
+        plt.bar(['TCP', 'UDP'], [active_tcp_connections, active_udp_connections], color=['blue', 'orange'])
+        plt.title('Active Connections')
+        plt.xlabel('Protocol')
+        plt.ylabel('Active Connections')
+
+        # Plot 4: Protocol Usage (Packet count per protocol) bar chart
+        # Ensure to handle small counts to make sure everything is shown
+        protocol_usage = {
+            "Ethernet": protocol_counts.get(1, 0),  # Protocol 1 = Ethernet
+            "TCP": protocol_counts.get(6, 0),       # Protocol 6 = TCP
+            "UDP": protocol_counts.get(17, 0),      # Protocol 17 = UDP
+        }
+
+        # Here we add a threshold to ensure that even low values are included
+        min_value_threshold = 1  # Minimum value threshold to show (adjust as needed)
+        protocol_usage = {protocol: max(count, min_value_threshold) for protocol, count in protocol_usage.items()}
+
+        plt.subplot(224)
+        plt.bar(protocol_usage.keys(), protocol_usage.values(), color=['gray', 'blue', 'orange'])
+        plt.title('Protocol Usage')
+        plt.xlabel('Protocol')
+        plt.ylabel('Packet Count')
+
+        # Adjust the layout for better spacing between plots
+        plt.tight_layout()
+
+        # Draw the graph and update the display
+        plt.draw()
+        
+        # Ensure smooth and frequent updates without too much delay
+        plt.pause(0.05)  # Reduce pause to allow quicker updates
+
+  
+
+if __name__ == "__main__":
+    try:
+        plt.ion()  
+
+        graph_thread = threading.Thread(target=update_graph, daemon=True)
+        capture_thread = threading.Thread(target=start_capture, daemon=True)
+        server_thread = threading.Thread(target=start_server, daemon=True)
+
+        graph_thread.start()
+        capture_thread.start()
+        server_thread.start()
+
+        while any(thread.is_alive() for thread in [graph_thread, capture_thread, server_thread]):
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Shutdown requested. Finalizing...")
+
+        exit_flag.set()
+
+        graph_thread.join(timeout=0.5)
+        capture_thread.join(timeout=0.5)
+        server_thread.join(timeout=0.5)
+        for thread in client_threads:
+            thread.join(timeout=0.5)
+        print("[INFO] All threads stopped. Program exiting gracefully.")
+
+    finally:
+        plt.ioff()  
+        plt.show()  
+        print("[INFO] Program terminated successfully.")
+        sys.exit(0)

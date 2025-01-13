@@ -1,6 +1,3 @@
-#Salma Naif Al-Mutairi 2210087
-#Alanoud Saleh Almakadi 2210596
-
 import sys
 import socket
 import threading
